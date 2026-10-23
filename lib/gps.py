@@ -1,0 +1,504 @@
+"""GPS — Gaussian Probability Softplus, both optimization forms in one module.
+
+The activation of the paper,
+
+    f(x) = softplus(x) - ln2 * exp(-a x^2 - b x)                    (2-parameter)
+
+and its convolutional training scheme,
+
+    f(x) = softplus(x) - ln2 * sum_i w_i exp(-a_i x^2 - b_i x)      (mixture)
+           w = softmax(logits),  sum_i w_i = 1
+
+where the three ``(a_i, b_i)`` are the fits of GELU, Swish and Mish by the
+2-parameter form and are held fixed; only the three logits are trained.  Both
+forms keep ``softplus(x)`` as the backbone, so for any parameters
+
+    f(x) -> 0  as x -> -inf,    f(x) -> x  as x -> +inf,    f(0) = 0,
+
+and the wave term is a Gaussian (single form) or a convex combination of the
+three fitted Gaussians (mixture form).
+
+The module also carries the paper's only hyperparameter rule, the activation
+learning-rate calibration: one epoch at unit multiplier measures how far the
+activation parameters travel, and the multiplier that spends a fixed budget
+``D`` over the remaining epochs follows in closed form.
+
+Typical use::
+
+    import gps
+
+    gps.swap_activations(model)                      # GELU/SiLU/Mish -> GPS
+    gps.share_parameters(gps.find(model), 'global')  # one (a, b) for the net
+
+    mult = gps.calibrate_lr_multiplier(model, run_one_epoch, epochs=200)
+    # ...now train with  act_lr = weight_lr * mult
+
+    model[0] = gps.GPS(form='mixture')               # the CNN scheme
+    gps.GPS(form='mixture').fold()                   # back to (a, b)
+
+Pure PyTorch: the reference implementation below is the readable version of the
+fused Triton kernel, which only matters for throughput.  ``gps_lab`` (the
+experiment runtime) exposes the same calibration as ``probe_multiplier``.
+"""
+from __future__ import annotations
+
+import math
+from typing import Callable, Iterable, List, Optional, Sequence, Tuple
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+__all__ = [
+    'LN2', 'MAX_EXP', 'BASIS', 'BASIS_ORDER', 'INIT_AB', 'INIT_W',
+    'GPS', 'gps_2param', 'gps_mixture', 'fold_weights',
+    'displacement', 'probe_multiplier', 'calibrate_lr_multiplier',
+    'find', 'share_parameters', 'swap_activations',
+]
+
+LN2 = math.log(2.0)
+
+#: The exponent is clamped here before ``exp`` (the forward pass of the Triton
+#: kernel does the same).  ``a < 0`` makes the exponent grow without bound; the
+#: clamp keeps the forward finite and pushes the failure into the gradient,
+#: which is where the paper's trust-region fallback intervenes.
+MAX_EXP = 80.0
+
+#: Table 2 of the paper: each static activation fitted by the 2-parameter form.
+BASIS = {
+    'gelu':  (0.35028508, 0.0),
+    'swish': (0.14575758, 0.0),
+    'mish':  (0.21961491, 0.16713308),
+}
+BASIS_ORDER = ('gelu', 'swish', 'mish')
+
+#: Chebyshev (min-max) centre of the three fits above in the (a, b) plane; the
+#: initialization of every 2-parameter run.
+INIT_AB = (0.221, 0.0)
+
+#: The weight vector whose least-squares image is that centre; the
+#: initialization of every mixture run.
+INIT_W = (0.361, 0.307, 0.332)
+
+_INIT_W_TENSOR = torch.tensor(INIT_W, dtype=torch.float32)
+
+
+# --------------------------------------------------------------------------- #
+# functional forms
+# --------------------------------------------------------------------------- #
+def gps_2param(x: torch.Tensor, a, b) -> torch.Tensor:
+    """``softplus(x) - ln2 * exp(-a x^2 - b x)``.
+
+    ``a`` and ``b`` may be python floats or tensors broadcastable to ``x``.
+    """
+    exponent = torch.clamp(-(a * x * x + b * x), max=MAX_EXP)
+    return F.softplus(x) - LN2 * torch.exp(exponent)
+
+
+def gps_mixture(x: torch.Tensor, w: torch.Tensor,
+                basis: Optional[torch.Tensor] = None) -> torch.Tensor:
+    """``softplus(x) - ln2 * sum_i w_i exp(-a_i x^2 - b_i x)``."""
+    if basis is None:
+        basis = _BASIS_TENSOR.to(device=x.device, dtype=x.dtype)
+    w = w.reshape(-1, 1).to(device=x.device, dtype=x.dtype)
+    a = basis[:, 0].to(device=x.device, dtype=x.dtype).reshape(-1, 1)
+    b = basis[:, 1].to(device=x.device, dtype=x.dtype).reshape(-1, 1)
+    exponent = torch.clamp(-(a * x * x + b * x), max=MAX_EXP)
+    return F.softplus(x) - LN2 * (w * torch.exp(exponent)).sum(0)
+
+
+_BASIS_TENSOR = torch.tensor(
+    [BASIS[name] for name in BASIS_ORDER], dtype=torch.float32)
+
+
+# --------------------------------------------------------------------------- #
+# the module
+# --------------------------------------------------------------------------- #
+class GPS(nn.Module):
+    """The GPS activation.
+
+    Parameters
+    ----------
+    form : ``'single'`` or ``'mixture'``
+        Which optimization form is being trained.
+    init : ``'minimax'`` (default), a pair ``(a, b)``, a 3-vector of weights, or
+        ``None`` for the paper's defaults -- (0.221, 0) for the 2-parameter form
+        and ``w* = (0.361, 0.307, 0.332)`` for the mixture.
+    basis : optional ``(3, 2)`` tensor of fixed ``(a_i, b_i)``, overriding Table 2.
+
+    Attributes
+    ----------
+    ``params``
+        The single trainable tensor, exposed under the name the experiment
+        runtime keys on: shape ``(2,)`` for ``'single'``, shape ``(3,)`` of
+        logits for ``'mixture'``.  Route it to its own optimizer group and set
+        that group's learning rate to ``weight_lr * mult``.
+    """
+
+    def __init__(self, form: str = 'single', init: Optional[object] = 'minimax',
+                 basis: Optional[torch.Tensor] = None):
+        super().__init__()
+        if form not in ('single', 'mixture'):
+            raise ValueError(f"form must be 'single' or 'mixture', got {form!r}")
+        self.form = form
+        if basis is None:
+            basis = _BASIS_TENSOR.clone()
+        self.register_buffer('basis', basis.to(torch.float32))
+
+        if form == 'single':
+            if init is None or init == 'minimax':
+                ab = INIT_AB
+            elif isinstance(init, str):
+                ab = BASIS[init]                      # start at a static's fit
+            else:
+                ab = tuple(float(v) for v in init)
+                if len(ab) != 2:
+                    raise ValueError(f'single form wants 2 parameters, got {len(ab)}')
+            self.params = nn.Parameter(torch.tensor(ab, dtype=torch.float32))
+        else:
+            if init is None or init == 'minimax':
+                w = INIT_W
+            elif isinstance(init, str):
+                w = [0.0, 0.0, 0.0]                   # a simplex vertex
+                w[BASIS_ORDER.index(init)] = 1.0
+            else:
+                w = tuple(float(v) for v in init)
+                if len(w) != 3:
+                    raise ValueError(f'mixture form wants 3 weights, got {len(w)}')
+                if any(v <= 0.0 for v in w):
+                    raise ValueError('mixture weights must be positive')
+                s = sum(w)
+                w = [v / s for v in w]
+            # train the logits, not the weights, so sum_i w_i == 1 holds for
+            # every parameter value
+            self.params = nn.Parameter(torch.log(torch.tensor(w, dtype=torch.float32)))
+
+    # -- evaluation ---------------------------------------------------------
+    def weights(self) -> torch.Tensor:
+        """Current mixture weights (``softmax`` of the logits)."""
+        return torch.softmax(self.params, dim=0)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.form == 'single':
+            a, b = self.params[0], self.params[1]
+            return gps_2param(x, a, b)
+        return gps_mixture(x, self.weights(), self.basis)
+
+    # -- runtime contract ---------------------------------------------------
+    @torch.no_grad()
+    def warmup(self, n: int = 1024) -> None:
+        """Touch the forward path once, on the parameter's device and dtype.
+
+        The fused kernel uses this to trigger Triton compilation before the
+        first real step; the reference implementation only needs the shape and
+        device to be exercised.
+        """
+        x = torch.randn(n, device=self.params.device, dtype=self.params.dtype)
+        self.forward(x)
+
+    # -- the two forms are interchangeable ----------------------------------
+    def fold(self, steps: int = 400, lr: float = 0.02
+             ) -> Tuple[float, float, float]:
+        """The 2-parameter GPS that best matches this mixture.
+
+        Solves ``(a, b) = argmin MSE(f_mixture, f_2param)`` on ``x in [-8, 8]``
+        -- the paper's map ``phi(w)``.  Use it to reduce a trained mixture to
+        the two-parameter form before deployment (recalibrate batch norm after).
+        Returns ``(a, b, mse)``.  For the single form this is the identity.
+        """
+        if self.form == 'single':
+            a, b = self.params.detach().cpu().tolist()
+            return float(a), float(b), 0.0
+        return fold_weights(self.weights().detach().cpu(), self.basis.detach().cpu(),
+                            steps=steps, lr=lr)
+
+    def to_form(self, form: str, **kwargs) -> 'GPS':
+        """A fresh module of the other form, starting at this one's fold."""
+        if form == self.form:
+            return self
+        if form == 'single':
+            a, b, _ = self.fold()
+            return GPS('single', init=(a, b), basis=self.basis.clone())
+        a, b = (self.params.detach().cpu().tolist() if self.form == 'single'
+                else self.fold()[:2])
+        # invert phi at (a, b) by a short fit on the simplex
+        w = _invert_fold(a, b, self.basis.detach().cpu(), **kwargs)
+        return GPS('mixture', init=w, basis=self.basis.clone())
+
+    def extra_repr(self) -> str:
+        if self.form == 'single':
+            a, b = self.params.detach().tolist()
+            return f"form='single', a={a:.4f}, b={b:.4f}"
+        w = torch.softmax(self.params, 0).detach().tolist()
+        return "form='mixture', w=[" + ', '.join(f'{v:.3f}' for v in w) + ']'
+
+
+# --------------------------------------------------------------------------- #
+# folding: mixture weights -> the two-parameter form
+# --------------------------------------------------------------------------- #
+def fold_weights(w: Sequence[float], basis: Optional[torch.Tensor] = None,
+                 steps: int = 400, lr: float = 0.02,
+                 init: Tuple[float, float] = INIT_AB,
+                 bounds: Sequence[Tuple[float, float]] = ((0.01, 1.5), (-1.5, 1.5)),
+                 n: int = 2001, lo: float = -8.0, hi: float = 8.0
+                 ) -> Tuple[float, float, float]:
+    """Least-squares projection of a mixture onto the 2-parameter form.
+
+    ``(a, b) = argmin MSE( gps_mixture(.|w), gps_2param(.|a,b) )`` on a uniform
+    grid over ``[lo, hi]``, solved by projected Adam from ``init``.  ``a`` is
+    constrained positive so the result is a valid GPS curve (the paper's
+    degenerate branch ``a <= 0`` is excluded).  Returns ``(a, b, mse)``.
+    """
+    if basis is None:
+        basis = _BASIS_TENSOR
+    x = torch.linspace(lo, hi, n, dtype=torch.float64)
+    w_t = torch.as_tensor(list(w), dtype=torch.float64)
+    if w_t.numel() != 3:
+        raise ValueError(f'expected 3 weights, got {w_t.numel()}')
+    if float(w_t.sum()) <= 0:
+        raise ValueError('weights must sum to a positive value')
+    w_t = w_t / w_t.sum()
+    target = gps_mixture(x, w_t, basis.to(torch.float64)).detach()
+
+    a = torch.tensor(float(init[0]), dtype=torch.float64, requires_grad=True)
+    b = torch.tensor(float(init[1]), dtype=torch.float64, requires_grad=True)
+    opt = torch.optim.Adam([a, b], lr=lr)
+    for _ in range(steps):
+        opt.zero_grad()
+        loss = F.mse_loss(gps_2param(x, a, b), target)
+        loss.backward()
+        opt.step()
+        with torch.no_grad():                          # keep the curve valid
+            a.clamp_(min=bounds[0][0], max=bounds[0][1])
+            b.clamp_(min=bounds[1][0], max=bounds[1][1])
+    with torch.no_grad():
+        mse = F.mse_loss(gps_2param(x, a.detach(), b.detach()), target).item()
+        a_v, b_v = float(a.detach()), float(b.detach())
+    return a_v, b_v, float(mse)
+
+
+def _invert_fold(a: float, b: float, basis: torch.Tensor,
+                 steps: int = 400, lr: float = 0.05) -> Tuple[float, float, float]:
+    """Weights whose fold lands near ``(a, b)``, i.e. a numerical ``phi^-1``."""
+    x = torch.linspace(-8.0, 8.0, 2001, dtype=torch.float64)
+    target = gps_2param(x, a, b).detach()
+    logits = torch.zeros(3, dtype=torch.float64, requires_grad=True)
+    opt = torch.optim.Adam([logits], lr=lr)
+    for _ in range(steps):
+        opt.zero_grad()
+        loss = F.mse_loss(gps_mixture(x, torch.softmax(logits, 0), basis.to(torch.float64)),
+                          target)
+        loss.backward()
+        opt.step()
+    with torch.no_grad():
+        w = torch.softmax(logits, 0).tolist()
+    return tuple(w)
+
+
+# --------------------------------------------------------------------------- #
+# learning-rate calibration
+# --------------------------------------------------------------------------- #
+def displacement(init: Sequence[torch.Tensor],
+                 after: Sequence[torch.Tensor]) -> float:
+    """Mean per-site L2 distance travelled by the activation parameters.
+
+    With one shared parameter tensor (``share='global'``) this is that tensor's
+    distance.  With one tensor per activation site the mean over sites is used
+    rather than the sum, which keeps the number in a single site's units and
+    independent of network depth.
+    """
+    if len(init) != len(after) or not init:
+        raise ValueError('init and after must be non-empty and of equal length')
+    total = 0.0
+    for p0, p1 in zip(init, after):
+        p0 = torch.as_tensor(p0).detach().to(torch.float64).reshape(-1)
+        p1 = torch.as_tensor(p1).detach().to(torch.float64).reshape(-1)
+        if p0.shape != p1.shape:
+            raise ValueError(f'parameter shape changed: {tuple(p0.shape)} -> {tuple(p1.shape)}')
+        total += float(torch.linalg.vector_norm(p1 - p0))
+    return total / len(init)
+
+
+def probe_multiplier(init: Sequence[torch.Tensor],
+                     after: Sequence[torch.Tensor],
+                     epochs: int,
+                     remaining: Optional[int] = None,
+                     target: float = 0.7,
+                     clip: Tuple[float, float] = (0.01, 10.0)) -> float:
+    """Activation learning-rate multiplier, as a multiple of the weight lr.
+
+    The activation group descends about ``rate`` distance units per epoch, and
+    ``rate`` is proportional to the multiplier, so the multiplier that spends a
+    budget ``target`` over the remaining epochs is
+
+        mult = target / (d * remaining),   d = displacement at unit multiplier
+
+    ``init`` is the activation state before training and ``after`` the state
+    after **one epoch trained with activation lr == weight lr**.  ``remaining``
+    defaults to ``epochs - 1`` (the in-run probe spends epoch 1 measuring);
+    pass ``epochs`` when the probe was a separate run and every epoch of the
+    real run is governed by the result.  Zero displacement means the probe saw
+    no signal, so the multiplier pins to the top of ``clip``.
+    """
+    if epochs < 2:
+        raise ValueError(f'epochs must be >= 2, got {epochs}')
+    if remaining is None:
+        remaining = epochs - 1
+    if remaining < 1:
+        raise ValueError(f'remaining must be >= 1, got {remaining}')
+    lo, hi = clip
+    if not 0.0 < lo <= hi:
+        raise ValueError(f'clip must satisfy 0 < lo <= hi, got {clip}')
+    d = displacement(init, after)
+    if d <= 0.0:
+        return float(hi)
+    return float(min(hi, max(lo, target / (d * remaining))))
+
+
+def calibrate_lr_multiplier(model: nn.Module,
+                            run_epoch: Callable[[], None],
+                            epochs: int,
+                            remaining: Optional[int] = None,
+                            target: float = 0.7,
+                            clip: Tuple[float, float] = (0.01, 10.0),
+                            modules: Optional[Iterable[GPS]] = None) -> float:
+    """Probe ``model`` for one epoch and return its activation lr multiplier.
+
+    ``run_epoch`` must train exactly one epoch with the activation learning rate
+    set **equal to the weight learning rate** (multiplier 1).  Afterwards the
+    returned value is the multiplier to use for the rest of training::
+
+        mult = calibrate_lr_multiplier(model, run_epoch, epochs=200)
+        for g in optimizer.param_groups:          # the activation group only
+            if is_activation_group(g):
+                g['lr'] = weight_lr * mult
+
+    The probe epoch is thrown away -- the paper restarts training with the
+    calibrated multiplier -- which costs one epoch.  Continuing from the probe
+    instead is equivalent to within the epoch's share of the budget, because
+    the first epoch falls inside the learning-rate warmup.
+    """
+    modules = list(modules if modules is not None else find(model))
+    if not modules:
+        raise ValueError('no GPS modules found in the model')
+    before = [m.params.detach().clone() for m in modules]
+    run_epoch()
+    after = [m.params.detach().clone() for m in modules]
+    return probe_multiplier(before, after, epochs, remaining=remaining,
+                            target=target, clip=clip)
+
+
+# --------------------------------------------------------------------------- #
+# model surgery
+# --------------------------------------------------------------------------- #
+_DEFAULT_TARGETS = tuple(t for t in (nn.GELU, getattr(nn, 'SiLU', None),
+                                     getattr(nn, 'Mish', None)) if t is not None)
+
+
+def find(model: nn.Module) -> List[GPS]:
+    """Every GPS module in ``model``, in definition order."""
+    return [m for m in model.modules() if isinstance(m, GPS)]
+
+
+def swap_activations(model: nn.Module, form: str = 'single',
+                     init: Optional[object] = 'minimax',
+                     targets: Optional[Sequence[type]] = None) -> List[GPS]:
+    """Replace every static activation in ``model`` with GPS, in place.
+
+    By default GELU, SiLU (Swish) and Mish become GPS -- the three functions the
+    paper approximates.  Returns the new modules, so a caller can then share or
+    group their parameters.  ReLU is deliberately not included: GPS is not
+    designed as a ReLU replacement.
+    """
+    targets = tuple(targets) if targets is not None else _DEFAULT_TARGETS
+
+    def walk(parent: nn.Module) -> List[GPS]:
+        out: List[GPS] = []
+        for name, child in list(parent.named_children()):
+            if isinstance(child, targets):
+                new = GPS(form=form, init=init)
+                setattr(parent, name, new)
+                out.append(new)
+            else:
+                out.extend(walk(child))
+        return out
+
+    replaced = walk(model)
+    if not replaced:
+        raise ValueError('no GELU/SiLU/Mish submodules found; pass targets=...')
+    return replaced
+
+
+def share_parameters(modules: Iterable[GPS], mode: str = 'global') -> None:
+    """Share the trainable tensor across activation sites.
+
+    ``'global'``  one parameter set for the whole network: 2 trainable numbers
+                  for a single-form GPS, 3 for a mixture, regardless of depth.
+    ``'none'``    one set per site (no change).
+
+    For a mixture, sharing the three logits means every layer uses the same
+    blend of the three Gaussians; ``'none'`` lets each layer choose.
+    """
+    modules = list(modules)
+    if mode == 'none':
+        return
+    if mode != 'global':
+        raise ValueError(f"mode must be 'global' or 'none', got {mode!r}")
+    if len(modules) < 2:
+        return
+    first = modules[0].params
+    if any(m.params.shape != first.shape for m in modules):
+        raise ValueError('cannot share: activation sites have different parameter shapes '
+                         '(are you mixing forms?)')
+    for m in modules:
+        m.params = first                          # same tensor, tied
+
+
+# --------------------------------------------------------------------------- #
+# smoke test
+# --------------------------------------------------------------------------- #
+if __name__ == '__main__':
+    torch.manual_seed(0)
+
+    net = nn.Sequential(nn.Linear(16, 32), nn.GELU(),
+                        nn.Linear(32, 32), nn.GELU(),
+                        nn.Linear(32, 4))
+    mods = swap_activations(net)
+    share_parameters(mods, 'global')
+    print(f'2-parameter form: {len(mods)} sites, {sum(p.numel() for p in net.parameters())} '
+          f'params total, {mods[0].params.numel()} trainable in the activation')
+
+    x = torch.randn(64, 16)
+    y = torch.randint(0, 4, (64,))
+    weight_params = [p for n, p in net.named_parameters() if 'params' not in n]
+    opt = torch.optim.AdamW([{'params': weight_params, 'lr': 1e-3},
+                             {'params': [mods[0].params], 'lr': 1e-3}],
+                            weight_decay=0.1)
+
+    def one_epoch(steps: int = 16):
+        for _ in range(steps):
+            opt.zero_grad()
+            F.cross_entropy(net(x), y).backward()
+            opt.step()
+
+    def probe():
+        before = [mods[0].params.detach().clone()]
+        one_epoch()                               # act lr == weight lr here
+        d = displacement(before, [mods[0].params.detach()])
+        print(f'probe epoch: activation moved d={d:.5f} in (a, b)')
+
+    mult = calibrate_lr_multiplier(net, probe, epochs=20)
+    print(f'calibrated multiplier: {mult:.3f}')
+
+    mix = GPS(form='mixture')
+    print(f'mixture form init: {mix}  weights sum to {float(mix.weights().detach().sum()):.6f}')
+    a, b, mse = mix.fold()
+    print(f'folded w* -> a={a:.4f}, b={b:.4f} (mse {mse:.2e}); '
+          f'INIT_AB={INIT_AB}')
+
+    for f in ('gelu', 'swish', 'mish'):
+        w = [0.0, 0.0, 0.0]
+        w[BASIS_ORDER.index(f)] = 1.0
+        a, b, mse = fold_weights(w)
+        print(f'  fold({f:5s}) -> a={a:.4f}, b={b:.4f} (mse {mse:.2e}); '
+              f'fit={BASIS[f]}')
