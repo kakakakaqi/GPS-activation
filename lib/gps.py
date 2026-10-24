@@ -27,14 +27,26 @@ Typical use::
 
     import gps
 
-    gps.swap_activations(model)                      # GELU/SiLU/Mish -> GPS
+    model = ...                                      # any network
+    gps.swap_activations(model, epochs=200)          # GELU/SiLU/Mish -> GPS
     gps.share_parameters(gps.find(model), 'global')  # one (a, b) for the net
 
-    mult = gps.calibrate_lr_multiplier(model, run_one_epoch, epochs=200)
-    # ...now train with  act_lr = weight_lr * mult
+    weight_lr = 1e-3
+    opt = torch.optim.AdamW([
+        {'params': weights(model), 'lr': weight_lr},
+        {'params': gps.find(model)[0].params,
+         'lr': weight_lr * gps.multiplier(model)},   # 0.5 to begin with
+    ])
 
-    model[0] = gps.GPS(form='mixture')               # the CNN scheme
-    gps.GPS(form='mixture').fold()                   # back to (a, b)
+    for epoch in range(200):
+        if epoch == 1:                               # one epoch has been trained
+            gps.calibrate(model)                     # measures, stores .multiplier
+            opt.param_groups[1]['lr'] = weight_lr * gps.multiplier(model)
+        train_one_epoch()
+
+The first epoch runs at the default multiplier (0.5) and ``calibrate`` accounts
+for that, so no special probe pass is needed.  For the convolutional scheme use
+``form='mixture'``, and ``GPS.fold()`` to return to the two-parameter form.
 
 Pure PyTorch: the reference implementation below is the readable version of the
 fused Triton kernel, which only matters for throughput.  ``gps_lab`` (the
@@ -53,7 +65,8 @@ import torch.nn.functional as F
 __all__ = [
     'LN2', 'MAX_EXP', 'BASIS', 'BASIS_ORDER', 'INIT_AB', 'INIT_W',
     'GPS', 'gps_2param', 'gps_mixture', 'fold_weights',
-    'displacement', 'probe_multiplier', 'calibrate_lr_multiplier',
+    'MULTIPLIER_DEFAULT', 'displacement', 'probe_multiplier', 'calibrate',
+    'calibrate_lr_multiplier', 'multiplier', 'multipliers', 'set_multiplier',
     'find', 'share_parameters', 'swap_activations',
 ]
 
@@ -82,6 +95,12 @@ INIT_AB = (0.221, 0.0)
 INIT_W = (0.361, 0.307, 0.332)
 
 _INIT_W_TENSOR = torch.tensor(INIT_W, dtype=torch.float32)
+
+#: Activation learning rate as a multiple of the weight learning rate, before
+#: calibration.  0.5 is the value the mixture scheme always uses and the value
+#: that every 2-parameter run starts from; :func:`calibrate` replaces it after
+#: the first epoch.
+MULTIPLIER_DEFAULT = 0.5
 
 
 # --------------------------------------------------------------------------- #
@@ -126,6 +145,13 @@ class GPS(nn.Module):
         ``None`` for the paper's defaults -- (0.221, 0) for the 2-parameter form
         and ``w* = (0.361, 0.307, 0.332)`` for the mixture.
     basis : optional ``(3, 2)`` tensor of fixed ``(a_i, b_i)``, overriding Table 2.
+    multiplier : float
+        Activation lr as a multiple of the weight lr.  Defaults to
+        :data:`MULTIPLIER_DEFAULT` (0.5) and is replaced in place by
+        :func:`calibrate` after the first epoch.
+    epochs : int, optional
+        Total epochs of the run, so that ``calibrate(model)`` needs no further
+        argument.  May also be passed to :func:`calibrate` directly.
 
     Attributes
     ----------
@@ -133,15 +159,29 @@ class GPS(nn.Module):
         The single trainable tensor, exposed under the name the experiment
         runtime keys on: shape ``(2,)`` for ``'single'``, shape ``(3,)`` of
         logits for ``'mixture'``.  Route it to its own optimizer group and set
-        that group's learning rate to ``weight_lr * mult``.
+        that group's learning rate to ``weight_lr * multiplier``.
+    ``multiplier``
+        The number above.  Read it with :func:`multiplier` (network level) and
+        update the optimizer group whenever it changes.
+    ``init_params``
+        Buffer holding the value ``params`` started from; the calibration
+        measures displacement against it.
     """
 
     def __init__(self, form: str = 'single', init: Optional[object] = 'minimax',
-                 basis: Optional[torch.Tensor] = None):
+                 basis: Optional[torch.Tensor] = None,
+                 multiplier: float = MULTIPLIER_DEFAULT,
+                 epochs: Optional[int] = None):
         super().__init__()
         if form not in ('single', 'mixture'):
             raise ValueError(f"form must be 'single' or 'mixture', got {form!r}")
         self.form = form
+        #: Activation lr as a multiple of the weight lr.  Starts at 0.5 and is
+        #: overwritten in place by :func:`calibrate` after the first epoch.
+        self.multiplier = float(multiplier)
+        #: Total epochs of the run, if known.  :func:`calibrate` needs it and
+        #: reads it from here when no ``epochs=`` argument is given.
+        self.epochs = epochs
         if basis is None:
             basis = _BASIS_TENSOR.clone()
         self.register_buffer('basis', basis.to(torch.float32))
@@ -256,9 +296,11 @@ class GPS(nn.Module):
     def extra_repr(self) -> str:
         if self.form == 'single':
             a, b = self.params.detach().tolist()
-            return f"form='single', a={a:.4f}, b={b:.4f}"
-        w = torch.softmax(self.params, 0).detach().tolist()
-        return "form='mixture', w=[" + ', '.join(f'{v:.3f}' for v in w) + ']'
+            body = f"form='single', a={a:.4f}, b={b:.4f}"
+        else:
+            w = torch.softmax(self.params, 0).detach().tolist()
+            body = "form='mixture', w=[" + ', '.join(f'{v:.3f}' for v in w) + ']'
+        return f'{body}, multiplier={self.multiplier:.3f}'
 
 
 # --------------------------------------------------------------------------- #
@@ -352,6 +394,7 @@ def probe_multiplier(init: Sequence[torch.Tensor],
                      epochs: int,
                      remaining: Optional[int] = None,
                      target: float = 0.7,
+                     probe_at: float = 1.0,
                      clip: Tuple[float, float] = (0.01, 10.0)) -> float:
     """Activation learning-rate multiplier, as a multiple of the weight lr.
 
@@ -359,14 +402,20 @@ def probe_multiplier(init: Sequence[torch.Tensor],
     ``rate`` is proportional to the multiplier, so the multiplier that spends a
     budget ``target`` over the remaining epochs is
 
-        mult = target / (d * remaining),   d = displacement at unit multiplier
+        mult = target / (d1 * remaining),   d1 = displacement at unit multiplier
 
     ``init`` is the activation state before training and ``after`` the state
-    after **one epoch trained with activation lr == weight lr**.  ``remaining``
-    defaults to ``epochs - 1`` (the in-run probe spends epoch 1 measuring);
-    pass ``epochs`` when the probe was a separate run and every epoch of the
-    real run is governed by the result.  Zero displacement means the probe saw
-    no signal, so the multiplier pins to the top of ``clip``.
+    after one epoch.  That epoch need not have run at unit multiplier: pass the
+    multiplier it *did* run at as ``probe_at`` and the displacement is rescaled
+    by it, ``d1 = displacement / probe_at``, which is exact to the accuracy of
+    the linearity in the multiplier.  With the default ``probe_at=1.0`` the
+    probe epoch ran at ``activation lr == weight lr``.
+
+    ``remaining`` defaults to ``epochs - 1`` -- the epochs still to be trained
+    when the multiplier is set after the first epoch.  Pass ``epochs`` when
+    training is restarted from scratch with the result, so that every epoch of
+    the new run is governed by it.  Zero displacement means the probe saw no
+    signal, so the multiplier pins to the top of ``clip``.
     """
     if epochs < 2:
         raise ValueError(f'epochs must be >= 2, got {epochs}')
@@ -374,13 +423,15 @@ def probe_multiplier(init: Sequence[torch.Tensor],
         remaining = epochs - 1
     if remaining < 1:
         raise ValueError(f'remaining must be >= 1, got {remaining}')
+    if probe_at <= 0.0:
+        raise ValueError(f'probe_at must be positive, got {probe_at}')
     lo, hi = clip
     if not 0.0 < lo <= hi:
         raise ValueError(f'clip must satisfy 0 < lo <= hi, got {clip}')
-    d = displacement(init, after)
-    if d <= 0.0:
+    d1 = displacement(init, after) / probe_at
+    if d1 <= 0.0:
         return float(hi)
-    return float(min(hi, max(lo, target / (d * remaining))))
+    return float(min(hi, max(lo, target / (d1 * remaining))))
 
 
 def _probe_state(modules: Sequence[GPS],
@@ -413,17 +464,22 @@ def calibrate_lr_multiplier(model: nn.Module,
                             target: float = 0.7,
                             clip: Tuple[float, float] = (0.01, 10.0),
                             modules: Optional[Iterable[GPS]] = None,
-                            init: Optional[Sequence[torch.Tensor]] = None) -> float:
+                            init: Optional[Sequence[torch.Tensor]] = None,
+                            probe_at: Optional[float] = None) -> float:
     """Return the activation learning-rate multiplier from a one-epoch probe.
 
     Two modes share this signature:
 
-    **Probe mode** (`run_epoch` given) -- train one epoch with the activation
-    learning rate set **equal to the weight learning rate** (multiplier 1), then
-    return the multiplier for the rest of training::
+    **Probe mode** (`run_epoch` given) -- train one epoch, then return the
+    multiplier for the rest of training::
 
         mult = calibrate_lr_multiplier(model, run_epoch, epochs=200)
         # activation group: g['lr'] = weight_lr * mult
+
+    The probe epoch should be run at unit multiplier, with the activation
+    learning rate **equal to the weight learning rate**.  If it is not -- e.g.
+    the loop already runs the first epoch at the default 0.5 -- pass that value
+    as ``probe_at`` and the displacement is rescaled to the unit rate.
 
     The probe epoch is thrown away -- the paper restarts training with the
     calibrated multiplier -- which costs one epoch.  Continuing from the probe
@@ -431,8 +487,8 @@ def calibrate_lr_multiplier(model: nn.Module,
     the first epoch falls inside the learning-rate warmup.
 
     **Already-probed mode** (`run_epoch=None`, the default) -- assume the model
-    has *already* trained exactly one epoch from its initialisation at unit
-    multiplier, and recompute the multiplier from where it now stands::
+    has *already* trained exactly one epoch from its initialisation, and
+    recompute the multiplier from where it now stands::
 
         mult = calibrate_lr_multiplier(model, epochs=200)   # no epoch is run
 
@@ -444,6 +500,9 @@ def calibrate_lr_multiplier(model: nn.Module,
     ``remaining`` is the number of epochs the multiplier governs; it defaults to
     ``epochs - 1``.  Pass ``remaining=epochs`` when training is restarted with
     the multiplier, so that every epoch of the new run is governed by it.
+
+    For the train-loop form that also *stores* the result on the modules, use
+    :func:`calibrate`.
     """
     modules = list(modules if modules is not None else find(model))
     if not modules:
@@ -458,8 +517,137 @@ def calibrate_lr_multiplier(model: nn.Module,
         _, current = _probe_state(modules)
         current = [c.detach().clone() for c in current]
 
+    if probe_at is None:
+        # probe mode: the caller ran the epoch at activation lr == weight lr.
+        # already-probed mode: the epoch ran at whatever the loop used, which is
+        # the multiplier the modules carry.
+        probe_at = 1.0 if run_epoch is not None else (_common_multiplier(modules) or 1.0)
+
     return probe_multiplier(starts, current, epochs, remaining=remaining,
-                            target=target, clip=clip)
+                            target=target, clip=clip, probe_at=probe_at)
+
+
+def _common_multiplier(modules: Sequence[GPS]) -> Optional[float]:
+    """The one multiplier shared by ``modules``, or ``None`` if they differ."""
+    values = {m.multiplier for m in modules}
+    return values.pop() if len(values) == 1 else None
+
+
+def multipliers(model: nn.Module) -> List[float]:
+    """Per-site activation lr multipliers, in module order."""
+    modules = find(model)
+    if not modules:
+        raise ValueError('no GPS modules found; use swap_activations() first')
+    return [m.multiplier for m in modules]
+
+
+def multiplier(model: nn.Module) -> float:
+    """The activation lr multiplier, as a multiple of the weight lr.
+
+    This is the number to put on the activation optimizer group::
+
+        {'params': gps_params(model), 'lr': weight_lr * gps.multiplier(model)}
+
+    0.5 until :func:`calibrate` has run, then whatever it measured.  Raises if
+    the sites disagree (``share='none'`` and per-site calibration) -- read
+    :func:`multipliers` instead.
+    """
+    modules = find(model)
+    if not modules:
+        raise ValueError('no GPS modules found; use swap_activations() first')
+    value = _common_multiplier(modules)
+    if value is None:
+        raise ValueError('activation sites have different multipliers; '
+                         'use multipliers(model) for the per-site list')
+    return value
+
+
+def set_multiplier(model: nn.Module, value: float) -> None:
+    """Set the activation lr multiplier on every GPS module."""
+    modules = find(model)
+    if not modules:
+        raise ValueError('no GPS modules found; use swap_activations() first')
+    for m in modules:
+        m.multiplier = float(value)
+
+
+def calibrate(model: nn.Module,
+              epochs: Optional[int] = None,
+              *,
+              remaining: Optional[int] = None,
+              target: float = 0.7,
+              clip: Tuple[float, float] = (0.01, 10.0),
+              init: Optional[Sequence[torch.Tensor]] = None,
+              probe_at: Optional[float] = None,
+              verbose: bool = False) -> float:
+    """Measure the activation lr multiplier and store it on the modules.
+
+    Call this once, after the first epoch, and apply the result to the
+    activation optimizer group for the remaining epochs::
+
+        model = nn.Sequential(nn.Linear(8, 32), nn.GELU(), nn.Linear(32, 2))
+        gps.swap_activations(model)          # multiplier defaults to 0.5
+        gps.share_parameters(gps.find(model), 'global')
+
+        weight_lr = 1e-3
+        opt = torch.optim.AdamW([
+            {'params': weights(model), 'lr': weight_lr},
+            {'params': gps.find(model)[0].params, 'lr': weight_lr * gps.multiplier(model)},
+        ])
+        for epoch in range(epochs):
+            if epoch == 1:                   # one epoch has been trained
+                gps.calibrate(model, epochs)  # updates .multiplier in place
+                opt.param_groups[1]['lr'] = weight_lr * gps.multiplier(model)
+            train_one_epoch()
+
+    The first epoch runs at the default multiplier (0.5); ``calibrate`` knows
+    that and rescales the displacement to the unit-multiplier rate, so the
+    probe does not have to be run specially.  ``epochs`` may be omitted when
+    every module was built with ``GPS(epochs=...)``.
+
+    Returns the multiplier stored (a float when the sites agree, which is the
+    normal case with ``share='global'``; otherwise a list in module order).
+    Nothing is trained here -- the model is assumed to be one epoch past its
+    initialisation.
+    """
+    modules = find(model)
+    if not modules:
+        raise ValueError('no GPS modules found; use swap_activations() first')
+    if epochs is None:
+        epochs = next((m.epochs for m in modules if m.epochs is not None), None)
+        if epochs is None:
+            raise ValueError('pass epochs=... (or build the modules with GPS(epochs=...))')
+    if probe_at is None:
+        probe_at = _common_multiplier(modules)
+
+    starts, current = _probe_state(modules, init)
+    # map each distinct tensor back to the site that owns it
+    seen, measured = set(), []
+    for m in modules:
+        if id(m.params) in seen:
+            continue
+        seen.add(id(m.params))
+        measured.append(m)
+
+    if probe_at is None:
+        values = [probe_multiplier([starts[i]], [current[i]], epochs,
+                                   remaining=remaining, target=target, clip=clip,
+                                   probe_at=measured[i].multiplier)
+                  for i in range(len(measured))]
+    else:
+        values = [probe_multiplier([starts[i]], [current[i]], epochs,
+                                   remaining=remaining, target=target, clip=clip,
+                                   probe_at=probe_at)
+                  for i in range(len(measured))]
+
+    seen = set()
+    for m, value in zip(measured, values):
+        for other in modules:                     # every site sharing this tensor
+            if other.params is m.params:
+                other.multiplier = value
+    if verbose:
+        print(f'calibrated activation multiplier: {values}')
+    return values[0] if len(values) == 1 else values
 
 
 # --------------------------------------------------------------------------- #
@@ -476,13 +664,18 @@ def find(model: nn.Module) -> List[GPS]:
 
 def swap_activations(model: nn.Module, form: str = 'single',
                      init: Optional[object] = 'minimax',
-                     targets: Optional[Sequence[type]] = None) -> List[GPS]:
+                     targets: Optional[Sequence[type]] = None,
+                     multiplier: float = MULTIPLIER_DEFAULT,
+                     epochs: Optional[int] = None) -> List[GPS]:
     """Replace every static activation in ``model`` with GPS, in place.
 
     By default GELU, SiLU (Swish) and Mish become GPS -- the three functions the
     paper approximates.  Returns the new modules, so a caller can then share or
     group their parameters.  ReLU is deliberately not included: GPS is not
     designed as a ReLU replacement.
+
+    ``multiplier`` and ``epochs`` are forwarded to every new module; pass
+    ``epochs`` here so that ``calibrate(model)`` needs no further argument.
     """
     targets = tuple(targets) if targets is not None else _DEFAULT_TARGETS
 
@@ -490,7 +683,8 @@ def swap_activations(model: nn.Module, form: str = 'single',
         out: List[GPS] = []
         for name, child in list(parent.named_children()):
             if isinstance(child, targets):
-                new = GPS(form=form, init=init)
+                new = GPS(form=form, init=init, multiplier=multiplier,
+                          epochs=epochs)
                 setattr(parent, name, new)
                 out.append(new)
             else:
@@ -534,41 +728,42 @@ def share_parameters(modules: Iterable[GPS], mode: str = 'global') -> None:
 if __name__ == '__main__':
     torch.manual_seed(0)
 
+    EPOCHS = 20
+    WEIGHT_LR = 1e-3
+
     net = nn.Sequential(nn.Linear(16, 32), nn.GELU(),
                         nn.Linear(32, 32), nn.GELU(),
                         nn.Linear(32, 4))
-    mods = swap_activations(net)
+    mods = swap_activations(net, epochs=EPOCHS)
     share_parameters(mods, 'global')
-    print(f'2-parameter form: {len(mods)} sites, {sum(p.numel() for p in net.parameters())} '
-          f'params total, {mods[0].params.numel()} trainable in the activation')
+    print(f'2-parameter form: {len(mods)} sites, '
+          f'{sum(p.numel() for p in net.parameters())} params total, '
+          f'{mods[0].params.numel()} trainable in the activation')
 
     x = torch.randn(64, 16)
     y = torch.randint(0, 4, (64,))
     weight_params = [p for n, p in net.named_parameters() if 'params' not in n]
-    opt = torch.optim.AdamW([{'params': weight_params, 'lr': 1e-3},
-                             {'params': [mods[0].params], 'lr': 1e-3}],
-                            weight_decay=0.1)
+    opt = torch.optim.AdamW(
+        [{'params': weight_params, 'lr': WEIGHT_LR},
+         {'params': [mods[0].params], 'lr': WEIGHT_LR * multiplier(net)}],
+        weight_decay=0.1)
 
-    def one_epoch(steps: int = 16):
+    def train_one_epoch(steps: int = 4):
         for _ in range(steps):
             opt.zero_grad()
             F.cross_entropy(net(x), y).backward()
             opt.step()
 
-    def probe():
-        before = [mods[0].params.detach().clone()]
-        one_epoch()                               # act lr == weight lr here
-        d = displacement(before, [mods[0].params.detach()])
-        print(f'probe epoch: activation moved d={d:.5f} in (a, b)')
-
-    mult = calibrate_lr_multiplier(net, probe, epochs=20)
-    print(f'calibrated multiplier: {mult:.3f}')
-
-    # the same answer without rerunning anything: assume the model is one epoch
-    # past its init and read the multiplier straight off its current state
-    recomputed = calibrate_lr_multiplier(net, epochs=20)
-    print(f'  recomputed from the post-probe state: {recomputed:.3f} '
-          f'({"agrees" if abs(recomputed - mult) < 1e-6 else "DISAGREES"})')
+    print(f'activation lr = weight lr x {multiplier(net):.3f} before calibration')
+    for epoch in range(EPOCHS):
+        if epoch == 1:                        # one epoch has been trained
+            calibrate(net)                    # stores .multiplier on the modules
+            opt.param_groups[1]['lr'] = WEIGHT_LR * multiplier(net)
+            print(f'  epoch {epoch}: calibrated to {multiplier(net):.3f}')
+        train_one_epoch()
+    d = displacement([torch.tensor(INIT_AB)], [mods[0].params.detach()])
+    print(f'after {EPOCHS} epochs the curve sits at {mods[0]} '
+          f'(travelled {d:.4f})')
 
     mix = GPS(form='mixture')
     print(f'mixture form init: {mix}  weights sum to {float(mix.weights().detach().sum()):.6f}')
