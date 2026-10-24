@@ -28,24 +28,26 @@ Typical use::
     import gps
 
     model = ...                                      # any network
-    gps.swap_activations(model, epochs=200)          # GELU/SiLU/Mish -> GPS
+    gps.swap_activations(model)                      # GELU/SiLU/Mish -> GPS
     gps.share_parameters(gps.find(model), 'global')  # one (a, b) for the net
 
     weight_lr = 1e-3
     opt = torch.optim.AdamW([
         {'params': weights(model), 'lr': weight_lr},
         {'params': gps.find(model)[0].params,
-         'lr': weight_lr * gps.multiplier(model)},   # 0.5 to begin with
+         'lr': weight_lr * gps.PROBE_MULTIPLIER},    # 1.0: epoch 1 is the probe
     ])
 
     for epoch in range(200):
         if epoch == 1:                               # one epoch has been trained
-            gps.calibrate(model, opt.param_groups[1])
+            gps.calibrate(model, opt.param_groups[1], epochs=200)
         train_one_epoch()
 
-The first epoch runs at the default multiplier (0.5) and ``calibrate`` accounts
-for that, so no special probe pass is needed.  For the convolutional scheme use
-``form='mixture'``, and ``GPS.fold()`` to return to the two-parameter form.
+The first epoch runs at ``PROBE_MULTIPLIER`` (1.0) so that its displacement
+measures the unit-rate the rule divides by; ``calibrate`` then replaces the
+activation lr with ``weight_lr * lambda``.  A run that is not probed keeps the
+fallback ``MULTIPLIER_DEFAULT`` (0.5).  For the convolutional scheme use
+``form='mixture'``, and ``fold(model)`` to return to the two-parameter form.
 
 Pure PyTorch: the reference implementation below is the readable version of the
 fused Triton kernel, which only matters for throughput.  ``gps_lab`` (the
@@ -64,9 +66,9 @@ import torch.nn.functional as F
 __all__ = [
     'LN2', 'MAX_EXP', 'BASIS', 'BASIS_ORDER', 'INIT_AB', 'INIT_W',
     'GPS', 'gps_2param', 'gps_mixture', 'fold_weights',
-    'MULTIPLIER_DEFAULT', 'displacement', 'probe_multiplier', 'calibrate',
+    'PROBE_MULTIPLIER', 'MULTIPLIER_DEFAULT', 'displacement', 'probe_multiplier', 'calibrate',
     'calibrate_lr_multiplier', 'multiplier', 'multipliers', 'set_multiplier',
-    'find', 'share_parameters', 'swap_activations',
+    'find', 'share_parameters', 'swap_activations', 'fold', 'warmup',
 ]
 
 LN2 = math.log(2.0)
@@ -95,10 +97,16 @@ INIT_W = (0.361, 0.307, 0.332)
 
 _INIT_W_TENSOR = torch.tensor(INIT_W, dtype=torch.float32)
 
-#: Activation learning rate as a multiple of the weight learning rate, before
-#: calibration.  0.5 is the value the mixture scheme always uses and the value
-#: that every 2-parameter run starts from; :func:`calibrate` replaces it after
-#: the first epoch.
+#: Activation learning rate as a multiple of the weight learning rate, used for
+#: the first epoch.  That epoch *is* the probe: it must run at unit multiplier
+#: (activation lr == weight lr) for the measured displacement to be the rate the
+#: rule divides by.
+PROBE_MULTIPLIER = 1.0
+
+#: The activation learning rate multiplier when no calibrated value is used --
+#: the fallback for a run that is not probed, and what ``multiplier()`` returns
+#: before :func:`calibrate` has run.  0.5 is also the value the mixture scheme
+#: always uses.
 MULTIPLIER_DEFAULT = 0.5
 
 
@@ -116,18 +124,49 @@ def gps_2param(x: torch.Tensor, a, b) -> torch.Tensor:
 
 def gps_mixture(x: torch.Tensor, w: torch.Tensor,
                 basis: Optional[torch.Tensor] = None) -> torch.Tensor:
-    """``softplus(x) - ln2 * sum_i w_i exp(-a_i x^2 - b_i x)``."""
+    """``softplus(x) - ln2 * sum_i w_i exp(-a_i x^2 - b_i x)``.
+
+    Elementwise, like the single form, so ``x`` may have any shape; it is
+    flattened for the three-term sum and reshaped afterwards.
+    """
     if basis is None:
         basis = _BASIS_TENSOR.to(device=x.device, dtype=x.dtype)
+    shape = x.shape
+    xf = x.reshape(-1)
     w = w.reshape(-1, 1).to(device=x.device, dtype=x.dtype)
     a = basis[:, 0].to(device=x.device, dtype=x.dtype).reshape(-1, 1)
     b = basis[:, 1].to(device=x.device, dtype=x.dtype).reshape(-1, 1)
-    exponent = torch.clamp(-(a * x * x + b * x), max=MAX_EXP)
-    return F.softplus(x) - LN2 * (w * torch.exp(exponent)).sum(0)
+    exponent = torch.clamp(-(a * xf * xf + b * xf), max=MAX_EXP)
+    out = F.softplus(xf) - LN2 * (w * torch.exp(exponent)).sum(0)
+    return out.reshape(shape)
 
 
 _BASIS_TENSOR = torch.tensor(
     [BASIS[name] for name in BASIS_ORDER], dtype=torch.float32)
+
+#: The fused Triton kernels, resolved on first use.  The reference functions
+#: above are numerically equivalent (they agree to float32 round-off); the
+#: kernels are what make GPS as fast as GELU, and they are the path the paper's
+#: runs used.  Imported lazily so that this module needs nothing but torch when
+#: they are absent or the tensors are on the CPU.
+_KERNELS: Optional[tuple] = None
+
+
+def _triton_kernels() -> Optional[tuple]:
+    """``(single_form, mixture_form)`` Triton functions, or ``None``."""
+    global _KERNELS
+    if _KERNELS is None:
+        try:
+            try:
+                from .gps_choice import _MixWave
+                from .gps_lab import GaussianDecaySoftplusTriton
+            except ImportError:
+                from gps_choice import _MixWave
+                from gps_lab import GaussianDecaySoftplusTriton
+            _KERNELS = (GaussianDecaySoftplusTriton, _MixWave)
+        except Exception:
+            _KERNELS = ()
+    return _KERNELS or None
 
 
 # --------------------------------------------------------------------------- #
@@ -144,13 +183,18 @@ class GPS(nn.Module):
         ``None`` for the paper's defaults -- (0.221, 0) for the 2-parameter form
         and ``w* = (0.361, 0.307, 0.332)`` for the mixture.
     basis : optional ``(3, 2)`` tensor of fixed ``(a_i, b_i)``, overriding Table 2.
-    multiplier : float
-        Activation lr as a multiple of the weight lr.  Defaults to
-        :data:`MULTIPLIER_DEFAULT` (0.5) and is replaced in place by
-        :func:`calibrate` after the first epoch.
-    epochs : int, optional
-        Total epochs of the run, so that ``calibrate(model)`` needs no further
-        argument.  May also be passed to :func:`calibrate` directly.
+    multiplier : float, optional
+        Activation lr as a multiple of the weight lr, used as the fallback and
+        as the result of calibration.  Defaults to :data:`MULTIPLIER_DEFAULT`
+        (0.5) and is replaced in place by :func:`calibrate` after the first
+        epoch.  The probe epoch itself runs at :data:`PROBE_MULTIPLIER` (1.0),
+        which is what makes the measurement interpretable.
+    backend : ``'auto'`` (default), ``'triton'`` or ``'torch'``
+        ``'auto'`` uses the fused Triton kernel for CUDA float32 tensors and
+        falls back to the PyTorch reference otherwise.  ``'triton'`` raises
+        instead of falling back, ``'torch'`` never uses the kernel.  The two
+        paths agree to float32 round-off; the kernel is why GPS costs ~0.4%
+        more per epoch than GELU instead of several times more.
 
     Attributes
     ----------
@@ -169,18 +213,24 @@ class GPS(nn.Module):
 
     def __init__(self, form: str = 'single', init: Optional[object] = 'minimax',
                  basis: Optional[torch.Tensor] = None,
-                 multiplier: float = MULTIPLIER_DEFAULT,
-                 epochs: Optional[int] = None):
+                 multiplier: Optional[float] = None,
+                 backend: str = 'auto'):
         super().__init__()
         if form not in ('single', 'mixture'):
             raise ValueError(f"form must be 'single' or 'mixture', got {form!r}")
         self.form = form
-        #: Activation lr as a multiple of the weight lr.  Starts at 0.5 and is
-        #: overwritten in place by :func:`calibrate` after the first epoch.
-        self.multiplier = float(multiplier)
-        #: Total epochs of the run, if known.  :func:`calibrate` needs it and
-        #: reads it from here when no ``epochs=`` argument is given.
-        self.epochs = epochs
+        if backend not in ('auto', 'triton', 'torch'):
+            raise ValueError(f"backend must be 'auto', 'triton' or 'torch', got {backend!r}")
+        #: Where the arithmetic runs: the fused Triton kernel ('triton'), the
+        #: plain-PyTorch reference ('torch'), or whichever is available ('auto').
+        self.backend = backend
+        #: Activation lr as a multiple of the weight lr, as a fallback and as
+        #: the result of calibration.  Starts at :data:`MULTIPLIER_DEFAULT`
+        #: (0.5) and is overwritten in place by :func:`calibrate`.  It is *not*
+        #: the value the probe epoch runs at -- that is
+        #: :data:`PROBE_MULTIPLIER` (1.0).
+        self.multiplier = (MULTIPLIER_DEFAULT if multiplier is None
+                           else float(multiplier))
         if basis is None:
             basis = _BASIS_TENSOR.clone()
         self.register_buffer('basis', basis.to(torch.float32))
@@ -223,23 +273,46 @@ class GPS(nn.Module):
         """Current mixture weights (``softmax`` of the logits)."""
         return torch.softmax(self.params, dim=0)
 
+    def _kernels(self, x: torch.Tensor) -> Optional[tuple]:
+        """The Triton functions to use for ``x``, or ``None`` for the reference."""
+        if self.backend == 'torch':
+            return None
+        kernels = _triton_kernels()
+        usable = (kernels is not None and x.is_cuda and self.params.is_cuda
+                  and x.dtype == torch.float32 and self.params.dtype == torch.float32)
+        if not usable:
+            if self.backend == 'triton':
+                raise RuntimeError(
+                    'backend="triton" needs the Triton kernels importable and '
+                    'CUDA float32 tensors for both x and the parameters')
+            return None
+        return kernels
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        kernels = self._kernels(x)
+        if kernels is not None:
+            single, mixture = kernels
+            if self.form == 'single':
+                return single.apply(x, self.params)
+            return mixture.apply(x, self.weights(), self.basis)
         if self.form == 'single':
-            a, b = self.params[0], self.params[1]
-            return gps_2param(x, a, b)
+            return gps_2param(x, self.params[0], self.params[1])
         return gps_mixture(x, self.weights(), self.basis)
 
     # -- runtime contract ---------------------------------------------------
-    @torch.no_grad()
     def warmup(self, n: int = 1024) -> None:
-        """Touch the forward path once, on the parameter's device and dtype.
+        """Compile the forward and backward paths on a throwaway tensor.
 
-        The fused kernel uses this to trigger Triton compilation before the
-        first real step; the reference implementation only needs the shape and
-        device to be exercised.
+        The fused kernel compiles and autotunes on first use, in both
+        directions; calling this after the model is on the device and before
+        the first optimizer step keeps that cost out of the first real step.
+        Any gradient produced here is discarded -- call it before training.
         """
         x = torch.randn(n, device=self.params.device, dtype=self.params.dtype)
-        self.forward(x)
+        out = self.forward(x)
+        if out.requires_grad:
+            out.sum().backward()
+        self.zero_grad(set_to_none=True)
 
     # -- the two forms are interchangeable ----------------------------------
     def fold(self, steps: int = 400, lr: float = 0.02, warn: bool = True
@@ -247,10 +320,10 @@ class GPS(nn.Module):
         """The 2-parameter GPS that best matches this mixture.
 
         Solves ``(a, b) = argmin MSE(f_mixture, f_2param)`` on ``x in [-8, 8]``
-        -- the paper's map ``phi(w)``.  Use it to reduce a trained mixture to
-        the two-parameter form before deployment.
-
-        Returns ``(a, b, mse)``.  For the single form this is the identity.
+        -- the paper's map ``phi(w)``.  Returns ``(a, b, mse)``; for the single
+        form this is the identity.  This only *reports* the fold.  To actually
+        convert a trained model to the two-parameter form, use the model-level
+        :func:`fold`.
 
         .. warning::
            Folding changes the curve at the activation, but **not** the batch
@@ -475,10 +548,10 @@ def calibrate_lr_multiplier(model: nn.Module,
         mult = calibrate_lr_multiplier(model, run_epoch, epochs=200)
         # activation group: g['lr'] = weight_lr * mult
 
-    The probe epoch should be run at unit multiplier, with the activation
-    learning rate **equal to the weight learning rate**.  If it is not -- e.g.
-    the loop already runs the first epoch at the default 0.5 -- pass that value
-    as ``probe_at`` and the displacement is rescaled to the unit rate.
+    The probe epoch is the first epoch of the run, at :data:`PROBE_MULTIPLIER`
+    (1.0): the activation learning rate **equal to the weight learning rate**.
+    That is the default; if your loop used another value, pass it as
+    ``probe_at`` and the displacement is rescaled to the unit rate.
 
     The probe epoch is thrown away -- the paper restarts training with the
     calibrated multiplier -- which costs one epoch.  Continuing from the probe
@@ -517,10 +590,9 @@ def calibrate_lr_multiplier(model: nn.Module,
         current = [c.detach().clone() for c in current]
 
     if probe_at is None:
-        # probe mode: the caller ran the epoch at activation lr == weight lr.
-        # already-probed mode: the epoch ran at whatever the loop used, which is
-        # the multiplier the modules carry.
-        probe_at = 1.0 if run_epoch is not None else (_common_multiplier(modules) or 1.0)
+        # both modes assume the standard loop: the first epoch ran at the probe
+        # multiplier (activation lr == weight lr), not at the fallback value
+        probe_at = PROBE_MULTIPLIER
 
     return probe_multiplier(starts, current, epochs, remaining=remaining,
                             target=target, clip=clip, probe_at=probe_at)
@@ -547,7 +619,9 @@ def multiplier(model: nn.Module) -> float:
 
         {'params': gps_params(model), 'lr': weight_lr * gps.multiplier(model)}
 
-    0.5 until :func:`calibrate` has run, then whatever it measured.  Raises if
+    :data:`MULTIPLIER_DEFAULT` (0.5) until :func:`calibrate` has run, then
+    whatever it measured.  Note that this is the *fallback* value: the probe
+    epoch should run at :data:`PROBE_MULTIPLIER` (1.0), not at this.  Raises if
     the sites disagree (``share='none'`` and per-site calibration) -- read
     :func:`multipliers` instead.
     """
@@ -573,7 +647,7 @@ def set_multiplier(model: nn.Module, value: float) -> None:
 def calibrate(model: nn.Module,
               param_group: Optional[dict] = None,
               *,
-              epochs: Optional[int] = None,
+              epochs: int,
               remaining: Optional[int] = None,
               target: float = 0.7,
               clip: Tuple[float, float] = (0.01, 10.0),
@@ -589,18 +663,18 @@ def calibrate(model: nn.Module,
     for the remaining epochs::
 
         model = nn.Sequential(nn.Linear(8, 32), nn.GELU(), nn.Linear(32, 2))
-        gps.swap_activations(model)          # multiplier defaults to 0.5
+        gps.swap_activations(model)
         gps.share_parameters(gps.find(model), 'global')
 
         weight_lr = 1e-3
         opt = torch.optim.AdamW([
             {'params': weights(model), 'lr': weight_lr},
             {'params': gps.find(model)[0].params,
-             'lr': weight_lr * gps.multiplier(model)},   # 0.5
+             'lr': weight_lr * gps.PROBE_MULTIPLIER},    # 1.0: the probe epoch
         ])
         for epoch in range(200):
             if epoch == 1:                   # one epoch has been trained
-                gps.calibrate(model, opt.param_groups[1])
+                gps.calibrate(model, opt.param_groups[1], epochs=200)
             train_one_epoch()
 
     ``param_group`` must be the group that holds the activation parameters, with
@@ -611,10 +685,14 @@ def calibrate(model: nn.Module,
     is already the bare weight rate), pass ``weight_lr=`` and it is used
     directly instead of being inferred.
 
-    The first epoch runs at the default multiplier (0.5); ``calibrate`` accounts
-    for that and rescales the displacement to the unit-multiplier rate, so no
-    special probe pass is needed.  ``epochs`` may be omitted when the modules
-    were built with ``GPS(epochs=...)`` or ``swap_activations(..., epochs=...)``.
+    The first epoch must run at :data:`PROBE_MULTIPLIER` (1.0) -- activation lr
+    equal to the weight lr -- because that epoch is the probe.  Pass
+    ``probe_at=`` if your loop used a different value and the displacement is
+    rescaled accordingly.  If the probe measures no travel at all, the fallback
+    :data:`MULTIPLIER_DEFAULT` (0.5) is stored instead.  ``epochs`` is the
+    total length of the run, and is required: it is what turns the measured
+    displacement into a multiplier, so it belongs to the calibration, not to the
+    model surgery.
 
     Returns the multiplier stored (a float when the sites agree, which is the
     normal case with ``share='global'``; otherwise a list in module order).
@@ -624,13 +702,12 @@ def calibrate(model: nn.Module,
     modules = find(model)
     if not modules:
         raise ValueError('no GPS modules found; use swap_activations() first')
-    if epochs is None:
-        epochs = next((m.epochs for m in modules if m.epochs is not None), None)
-        if epochs is None:
-            raise ValueError('pass epochs=... (or build the modules with GPS(epochs=...))')
 
-    # the multiplier in force during the probed epoch, before it is overwritten
-    probed_at = probe_at if probe_at is not None else _common_multiplier(modules)
+    # The probed epoch ran at the probe multiplier by definition; a caller
+    # whose loop used something else says so explicitly.
+    probed_at = PROBE_MULTIPLIER if probe_at is None else float(probe_at)
+    if probed_at <= 0.0:
+        raise ValueError(f'probe_at must be positive, got {probed_at}')
 
     starts, current = _probe_state(modules, init)
     seen, measured = set(), []                    # one entry per distinct tensor
@@ -640,12 +717,15 @@ def calibrate(model: nn.Module,
         seen.add(id(m.params))
         measured.append(m)
 
-    scales = ([probed_at] * len(measured) if probed_at is not None
-              else [m.multiplier for m in measured])
-    values = [probe_multiplier([starts[i]], [current[i]], epochs,
-                               remaining=remaining, target=target, clip=clip,
-                               probe_at=scales[i])
-              for i in range(len(measured))]
+    values = []
+    for i in range(len(measured)):
+        if displacement([starts[i]], [current[i]]) <= 0.0:
+            # the probe saw no travel at all: fall back rather than divide by zero
+            values.append(MULTIPLIER_DEFAULT)
+            continue
+        values.append(probe_multiplier([starts[i]], [current[i]], epochs,
+                                       remaining=remaining, target=target,
+                                       clip=clip, probe_at=probed_at))
 
     for m, value in zip(measured, values):        # every site sharing this tensor
         for other in modules:
@@ -686,11 +766,22 @@ def find(model: nn.Module) -> List[GPS]:
     return [m for m in model.modules() if isinstance(m, GPS)]
 
 
+def warmup(model: nn.Module, n: int = 1024) -> None:
+    """Warm every GPS module up: compile the Triton kernel, discard the grads.
+
+    Call after the model is on the GPU and before the first optimizer step;
+    otherwise the first step pays the compilation cost.  Cheap on the PyTorch
+    path.
+    """
+    for m in find(model):
+        m.warmup(n)
+
+
 def swap_activations(model: nn.Module, form: str = 'single',
                      init: Optional[object] = 'minimax',
                      targets: Optional[Sequence[type]] = None,
-                     multiplier: float = MULTIPLIER_DEFAULT,
-                     epochs: Optional[int] = None) -> List[GPS]:
+                     multiplier: Optional[float] = None,
+                     backend: str = 'auto') -> List[GPS]:
     """Replace every static activation in ``model`` with GPS, in place.
 
     By default GELU, SiLU (Swish) and Mish become GPS -- the three functions the
@@ -698,8 +789,8 @@ def swap_activations(model: nn.Module, form: str = 'single',
     group their parameters.  ReLU is deliberately not included: GPS is not
     designed as a ReLU replacement.
 
-    ``multiplier`` and ``epochs`` are forwarded to every new module; pass
-    ``epochs`` here so that ``calibrate(model)`` needs no further argument.
+    ``multiplier`` is forwarded to every new module (it is the fallback value;
+    the length of the run belongs to :func:`calibrate`, not here).
     """
     targets = tuple(targets) if targets is not None else _DEFAULT_TARGETS
 
@@ -708,7 +799,7 @@ def swap_activations(model: nn.Module, form: str = 'single',
         for name, child in list(parent.named_children()):
             if isinstance(child, targets):
                 new = GPS(form=form, init=init, multiplier=multiplier,
-                          epochs=epochs)
+                          backend=backend)
                 setattr(parent, name, new)
                 out.append(new)
             else:
@@ -718,7 +809,66 @@ def swap_activations(model: nn.Module, form: str = 'single',
     replaced = walk(model)
     if not replaced:
         raise ValueError('no GELU/SiLU/Mish submodules found; pass targets=...')
+    # Follow the model's device, so swapping is safe after model.cuda() as well
+    # as before.  The parameters stay float32: the fused kernel requires it, and
+    # under AMP the activation parameters are normally kept in float32 anyway.
+    ref = next((p for p in model.parameters()), None)
+    if ref is None:
+        ref = next((b for b in model.buffers()), None)
+    if ref is not None and ref.device.type != 'cpu':
+        for m in replaced:
+            m.to(device=ref.device)
     return replaced
+
+
+def fold(model: nn.Module, *, steps: int = 400, lr: float = 0.02,
+         warn: bool = True) -> List[Tuple[float, float, float]]:
+    """Reduce every mixture-form GPS in ``model`` to the two-parameter form.
+
+    This is the paper's deployment step.  A trained mixture is projected onto the
+    two-parameter curve by :func:`fold_weights` and each module is converted in
+    place, so the network carries on running -- now with two trainable numbers
+    per site instead of three::
+
+        gps.swap_activations(model, form='mixture')
+        train(model)                       # the CNN scheme, lambda = 0.5
+        gps.fold(model)                    # every mixture site -> its fold
+        recalibrate_batchnorm(model)       # the fold does not move BN statistics
+
+    Returns ``(a, b, mse)`` per folded site, in definition order.  Sites that
+    already use the single form are left alone.
+
+    .. warning::
+       The fold changes the curve at each activation but **not** the batch-norm
+       statistics, which were collected while the network was running the
+       mixture.  Recalibrate batch norm (a forward pass over the training data in
+       ``eval()`` mode) before measuring or deploying the folded model -- the
+       paper does this.  Silence this with ``warn=False``.
+    """
+    modules = [m for m in find(model) if m.form == 'mixture']
+    if not modules:
+        raise ValueError('no mixture-form GPS modules to fold; build them with '
+                         "swap_activations(model, form='mixture')")
+    results = []
+    for m in modules:
+        a, b, mse = fold_weights(m.weights().detach().cpu(),
+                                 m.basis.detach().cpu(), steps=steps, lr=lr)
+        # convert the module in place: same object, same device, same multiplier,
+        # so anything holding a reference to it (including a shared parameter)
+        # keeps working
+        device, dtype = m.params.device, m.params.dtype
+        m.form = 'single'
+        m.params = nn.Parameter(torch.tensor([a, b], device=device, dtype=dtype))
+        m.init_params = m.params.detach().clone()   # the buffer, re-seeded
+        results.append((a, b, mse))
+    if warn:
+        warnings.warn(
+            f'fold() converted {len(modules)} mixture site(s) to the two-parameter '
+            'form but left the batch-norm statistics alone. Recalibrate batch norm '
+            '(forward pass over the training data in eval() mode) before '
+            'evaluating or deploying the model.',
+            RuntimeWarning, stacklevel=2)
+    return results
 
 
 def share_parameters(modules: Iterable[GPS], mode: str = 'global') -> None:
@@ -758,7 +908,7 @@ if __name__ == '__main__':
     net = nn.Sequential(nn.Linear(16, 32), nn.GELU(),
                         nn.Linear(32, 32), nn.GELU(),
                         nn.Linear(32, 4))
-    mods = swap_activations(net, epochs=EPOCHS)
+    mods = swap_activations(net)
     share_parameters(mods, 'global')
     print(f'2-parameter form: {len(mods)} sites, '
           f'{sum(p.numel() for p in net.parameters())} params total, '
@@ -769,7 +919,7 @@ if __name__ == '__main__':
     weight_params = [p for n, p in net.named_parameters() if 'params' not in n]
     opt = torch.optim.AdamW(
         [{'params': weight_params, 'lr': WEIGHT_LR},
-         {'params': [mods[0].params], 'lr': WEIGHT_LR * multiplier(net)}],
+         {'params': [mods[0].params], 'lr': WEIGHT_LR * PROBE_MULTIPLIER}],
         weight_decay=0.1)
 
     def train_one_epoch(steps: int = 4):
@@ -778,10 +928,11 @@ if __name__ == '__main__':
             F.cross_entropy(net(x), y).backward()
             opt.step()
 
-    print(f'activation lr = weight lr x {multiplier(net):.3f} before calibration')
+    print(f'activation lr = weight lr x {PROBE_MULTIPLIER:.1f} for the probe epoch '
+          f'(fallback {MULTIPLIER_DEFAULT})')
     for epoch in range(EPOCHS):
         if epoch == 1:                        # one epoch has been trained
-            calibrate(net, opt.param_groups[1])
+            calibrate(net, opt.param_groups[1], epochs=EPOCHS)
             print(f'  epoch {epoch}: multiplier {multiplier(net):.3f}, '
                   f'act lr {opt.param_groups[1]["lr"]:.2e}')
         train_one_epoch()
@@ -789,11 +940,16 @@ if __name__ == '__main__':
     print(f'after {EPOCHS} epochs the curve sits at {mods[0]} '
           f'(travelled {d:.4f})')
 
-    mix = GPS(form='mixture')
-    print(f'mixture form init: {mix}  weights sum to {float(mix.weights().detach().sum()):.6f}')
-    a, b, mse = mix.fold()                        # warns about batch norm
-    print(f'folded w* -> a={a:.4f}, b={b:.4f} (mse {mse:.2e}); '
-          f'INIT_AB={INIT_AB}')
+    print('-' * 62)
+    net_mix = nn.Sequential(nn.Linear(16, 32), nn.GELU(), nn.Linear(32, 4))
+    swap_activations(net_mix, form='mixture')
+    print(f'mixture form: {find(net_mix)[0]}  '
+          f'(weights sum to {float(find(net_mix)[0].weights().detach().sum()):.3f})')
+    folds = fold(net_mix)                         # warns about batch norm
+    print(f'after fold(model): forms {[m.form for m in find(net_mix)]}, '
+          f'params per site {[m.params.numel() for m in find(net_mix)]}')
+    print(f'  per-site fold (a, b): {[(round(a, 4), round(b, 4)) for a, b, _ in folds]}')
+
 
     for f in ('gelu', 'swish', 'mish'):
         w = [0.0, 0.0, 0.0]

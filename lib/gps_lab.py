@@ -77,6 +77,13 @@ def gaussian_decay_softplus_fwd_kernel(
         triton.Config({'BLOCK_SIZE': 4096}, num_warps=8, num_stages=2),
     ],
     key=['n_elements'],
+    # The backward ATOMICS into grad_params.  Autotuning benchmarks every
+    # config using the real buffers, so without this restore the first backward
+    # of each shape returns the benchmark trials' accumulations added to the
+    # true gradient (measured: ~1373x too large, one update).  restore_value
+    # snapshots the buffer before benchmarking and copies it back after each
+    # trial, so the graded launch starts from an empty accumulator.
+    restore_value=['grad_params_ptr'],
 )
 @triton.jit
 def gaussian_decay_softplus_bwd_kernel(
