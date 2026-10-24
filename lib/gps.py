@@ -43,6 +43,7 @@ experiment runtime) exposes the same calibration as ``probe_multiplier``.
 from __future__ import annotations
 
 import math
+import warnings
 from typing import Callable, Iterable, List, Optional, Sequence, Tuple
 
 import torch
@@ -173,6 +174,11 @@ class GPS(nn.Module):
             # every parameter value
             self.params = nn.Parameter(torch.log(torch.tensor(w, dtype=torch.float32)))
 
+        #: The value ``params`` started from.  The learning-rate calibration
+        #: compares the current parameters against this, so a probe needs to
+        #: know only where the run began -- not the paper's constants.
+        self.register_buffer('init_params', self.params.detach().clone())
+
     # -- evaluation ---------------------------------------------------------
     def weights(self) -> torch.Tensor:
         """Current mixture weights (``softmax`` of the logits)."""
@@ -197,32 +203,54 @@ class GPS(nn.Module):
         self.forward(x)
 
     # -- the two forms are interchangeable ----------------------------------
-    def fold(self, steps: int = 400, lr: float = 0.02
+    def fold(self, steps: int = 400, lr: float = 0.02, warn: bool = True
              ) -> Tuple[float, float, float]:
         """The 2-parameter GPS that best matches this mixture.
 
         Solves ``(a, b) = argmin MSE(f_mixture, f_2param)`` on ``x in [-8, 8]``
         -- the paper's map ``phi(w)``.  Use it to reduce a trained mixture to
-        the two-parameter form before deployment (recalibrate batch norm after).
+        the two-parameter form before deployment.
+
         Returns ``(a, b, mse)``.  For the single form this is the identity.
+
+        .. warning::
+           Folding changes the curve at the activation, but **not** the batch
+           normalisation statistics that were collected while the network was
+           running the mixture.  Recalibrate batch norm (a forward pass over the
+           training data in ``eval()`` mode) before measuring or deploying the
+           folded model -- the paper does this, and skips it at your peril.
+           That recalibration is not part of this method, hence the warning;
+           silence it with ``warn=False`` when folding in a loop.
         """
         if self.form == 'single':
             a, b = self.params.detach().cpu().tolist()
             return float(a), float(b), 0.0
+        if warn:
+            warnings.warn(
+                'fold() maps only the activation curve: the batch-norm statistics '
+                'still belong to the mixture. Recalibrate batch norm (forward pass '
+                'over the training data in eval() mode) before evaluating or '
+                'deploying the folded model.',
+                RuntimeWarning, stacklevel=2)
         return fold_weights(self.weights().detach().cpu(), self.basis.detach().cpu(),
                             steps=steps, lr=lr)
 
     def to_form(self, form: str, **kwargs) -> 'GPS':
-        """A fresh module of the other form, starting at this one's fold."""
+        """A fresh module of the other form, starting at this one's fold.
+
+        Converting a mixture to the single form warns: see :meth:`fold`.
+        """
         if form == self.form:
             return self
         if form == 'single':
-            a, b, _ = self.fold()
+            a, b, _ = self.fold(**{k: v for k, v in kwargs.items()
+                                   if k in ('steps', 'lr', 'warn')})
             return GPS('single', init=(a, b), basis=self.basis.clone())
         a, b = (self.params.detach().cpu().tolist() if self.form == 'single'
-                else self.fold()[:2])
+                else self.fold(warn=False)[:2])
         # invert phi at (a, b) by a short fit on the simplex
-        w = _invert_fold(a, b, self.basis.detach().cpu(), **kwargs)
+        w = _invert_fold(a, b, self.basis.detach().cpu(),
+                         **{k: v for k, v in kwargs.items() if k in ('steps', 'lr')})
         return GPS('mixture', init=w, basis=self.basis.clone())
 
     def extra_repr(self) -> str:
@@ -355,36 +383,82 @@ def probe_multiplier(init: Sequence[torch.Tensor],
     return float(min(hi, max(lo, target / (d * remaining))))
 
 
+def _probe_state(modules: Sequence[GPS],
+                 init: Optional[Sequence[torch.Tensor]] = None
+                 ) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
+    """``(starting state, current state)`` of each distinct activation tensor.
+
+    Under ``share='global'`` every site holds the *same* parameter object, so
+    the tensors are deduplicated by identity and each one is measured once.
+    """
+    if init is not None:
+        init = [torch.as_tensor(v) for v in init]
+        if len(init) != len(modules):
+            raise ValueError(f'init has {len(init)} entries for {len(modules)} modules')
+    seen, starts, current = set(), [], []
+    for i, m in enumerate(modules):
+        if id(m.params) in seen:
+            continue
+        seen.add(id(m.params))
+        starts.append(init[i] if init is not None else m.init_params)
+        current.append(m.params.detach())
+    return starts, current
+
+
 def calibrate_lr_multiplier(model: nn.Module,
-                            run_epoch: Callable[[], None],
+                            run_epoch: Optional[Callable[[], None]] = None,
+                            *,
                             epochs: int,
                             remaining: Optional[int] = None,
                             target: float = 0.7,
                             clip: Tuple[float, float] = (0.01, 10.0),
-                            modules: Optional[Iterable[GPS]] = None) -> float:
-    """Probe ``model`` for one epoch and return its activation lr multiplier.
+                            modules: Optional[Iterable[GPS]] = None,
+                            init: Optional[Sequence[torch.Tensor]] = None) -> float:
+    """Return the activation learning-rate multiplier from a one-epoch probe.
 
-    ``run_epoch`` must train exactly one epoch with the activation learning rate
-    set **equal to the weight learning rate** (multiplier 1).  Afterwards the
-    returned value is the multiplier to use for the rest of training::
+    Two modes share this signature:
+
+    **Probe mode** (`run_epoch` given) -- train one epoch with the activation
+    learning rate set **equal to the weight learning rate** (multiplier 1), then
+    return the multiplier for the rest of training::
 
         mult = calibrate_lr_multiplier(model, run_epoch, epochs=200)
-        for g in optimizer.param_groups:          # the activation group only
-            if is_activation_group(g):
-                g['lr'] = weight_lr * mult
+        # activation group: g['lr'] = weight_lr * mult
 
     The probe epoch is thrown away -- the paper restarts training with the
     calibrated multiplier -- which costs one epoch.  Continuing from the probe
     instead is equivalent to within the epoch's share of the budget, because
     the first epoch falls inside the learning-rate warmup.
+
+    **Already-probed mode** (`run_epoch=None`, the default) -- assume the model
+    has *already* trained exactly one epoch from its initialisation at unit
+    multiplier, and recompute the multiplier from where it now stands::
+
+        mult = calibrate_lr_multiplier(model, epochs=200)   # no epoch is run
+
+    The starting point is each module's ``init_params`` (recorded when it was
+    built), so this works on a model trained elsewhere, on a checkpoint, or on
+    the epoch that the probe mode would otherwise have to rerun.  Pass ``init``
+    to override it, e.g. with the constants a checkpoint was built from.
+
+    ``remaining`` is the number of epochs the multiplier governs; it defaults to
+    ``epochs - 1``.  Pass ``remaining=epochs`` when training is restarted with
+    the multiplier, so that every epoch of the new run is governed by it.
     """
     modules = list(modules if modules is not None else find(model))
     if not modules:
         raise ValueError('no GPS modules found in the model')
-    before = [m.params.detach().clone() for m in modules]
-    run_epoch()
-    after = [m.params.detach().clone() for m in modules]
-    return probe_multiplier(before, after, epochs, remaining=remaining,
+
+    if run_epoch is None:
+        starts, current = _probe_state(modules, init)
+    else:
+        starts, _ = _probe_state(modules, init)
+        starts = [torch.as_tensor(s).detach().clone() for s in starts]
+        run_epoch()
+        _, current = _probe_state(modules)
+        current = [c.detach().clone() for c in current]
+
+    return probe_multiplier(starts, current, epochs, remaining=remaining,
                             target=target, clip=clip)
 
 
@@ -490,9 +564,15 @@ if __name__ == '__main__':
     mult = calibrate_lr_multiplier(net, probe, epochs=20)
     print(f'calibrated multiplier: {mult:.3f}')
 
+    # the same answer without rerunning anything: assume the model is one epoch
+    # past its init and read the multiplier straight off its current state
+    recomputed = calibrate_lr_multiplier(net, epochs=20)
+    print(f'  recomputed from the post-probe state: {recomputed:.3f} '
+          f'({"agrees" if abs(recomputed - mult) < 1e-6 else "DISAGREES"})')
+
     mix = GPS(form='mixture')
     print(f'mixture form init: {mix}  weights sum to {float(mix.weights().detach().sum()):.6f}')
-    a, b, mse = mix.fold()
+    a, b, mse = mix.fold()                        # warns about batch norm
     print(f'folded w* -> a={a:.4f}, b={b:.4f} (mse {mse:.2e}); '
           f'INIT_AB={INIT_AB}')
 
