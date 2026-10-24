@@ -40,8 +40,7 @@ Typical use::
 
     for epoch in range(200):
         if epoch == 1:                               # one epoch has been trained
-            gps.calibrate(model)                     # measures, stores .multiplier
-            opt.param_groups[1]['lr'] = weight_lr * gps.multiplier(model)
+            gps.calibrate(model, opt.param_groups[1])
         train_one_epoch()
 
 The first epoch runs at the default multiplier (0.5) and ``calibrate`` accounts
@@ -572,18 +571,22 @@ def set_multiplier(model: nn.Module, value: float) -> None:
 
 
 def calibrate(model: nn.Module,
-              epochs: Optional[int] = None,
+              param_group: Optional[dict] = None,
               *,
+              epochs: Optional[int] = None,
               remaining: Optional[int] = None,
               target: float = 0.7,
               clip: Tuple[float, float] = (0.01, 10.0),
               init: Optional[Sequence[torch.Tensor]] = None,
               probe_at: Optional[float] = None,
+              weight_lr: Optional[float] = None,
               verbose: bool = False) -> float:
-    """Measure the activation lr multiplier and store it on the modules.
+    """Measure the activation lr multiplier and apply it.
 
-    Call this once, after the first epoch, and apply the result to the
-    activation optimizer group for the remaining epochs::
+    Call this once, after the first epoch.  It measures how far the activation
+    parameters travelled, stores the new multiplier on the modules, and -- when
+    the activation optimizer group is passed -- sets that group's learning rate
+    for the remaining epochs::
 
         model = nn.Sequential(nn.Linear(8, 32), nn.GELU(), nn.Linear(32, 2))
         gps.swap_activations(model)          # multiplier defaults to 0.5
@@ -592,18 +595,26 @@ def calibrate(model: nn.Module,
         weight_lr = 1e-3
         opt = torch.optim.AdamW([
             {'params': weights(model), 'lr': weight_lr},
-            {'params': gps.find(model)[0].params, 'lr': weight_lr * gps.multiplier(model)},
+            {'params': gps.find(model)[0].params,
+             'lr': weight_lr * gps.multiplier(model)},   # 0.5
         ])
-        for epoch in range(epochs):
+        for epoch in range(200):
             if epoch == 1:                   # one epoch has been trained
-                gps.calibrate(model, epochs)  # updates .multiplier in place
-                opt.param_groups[1]['lr'] = weight_lr * gps.multiplier(model)
+                gps.calibrate(model, opt.param_groups[1])
             train_one_epoch()
 
-    The first epoch runs at the default multiplier (0.5); ``calibrate`` knows
-    that and rescales the displacement to the unit-multiplier rate, so the
-    probe does not have to be run specially.  ``epochs`` may be omitted when
-    every module was built with ``GPS(epochs=...)``.
+    ``param_group`` must be the group that holds the activation parameters, with
+    its learning rate currently set to ``weight_lr * gps.multiplier(model)`` --
+    which is what the loop above does, and what the first epoch trained at.  The
+    new rate is ``weight_lr * mult``, so the group is rescaled by
+    ``new_mult / old_mult``.  If the group's rate is not of that form (e.g. it
+    is already the bare weight rate), pass ``weight_lr=`` and it is used
+    directly instead of being inferred.
+
+    The first epoch runs at the default multiplier (0.5); ``calibrate`` accounts
+    for that and rescales the displacement to the unit-multiplier rate, so no
+    special probe pass is needed.  ``epochs`` may be omitted when the modules
+    were built with ``GPS(epochs=...)`` or ``swap_activations(..., epochs=...)``.
 
     Returns the multiplier stored (a float when the sites agree, which is the
     normal case with ``share='global'``; otherwise a list in module order).
@@ -617,37 +628,50 @@ def calibrate(model: nn.Module,
         epochs = next((m.epochs for m in modules if m.epochs is not None), None)
         if epochs is None:
             raise ValueError('pass epochs=... (or build the modules with GPS(epochs=...))')
-    if probe_at is None:
-        probe_at = _common_multiplier(modules)
+
+    # the multiplier in force during the probed epoch, before it is overwritten
+    probed_at = probe_at if probe_at is not None else _common_multiplier(modules)
 
     starts, current = _probe_state(modules, init)
-    # map each distinct tensor back to the site that owns it
-    seen, measured = set(), []
+    seen, measured = set(), []                    # one entry per distinct tensor
     for m in modules:
         if id(m.params) in seen:
             continue
         seen.add(id(m.params))
         measured.append(m)
 
-    if probe_at is None:
-        values = [probe_multiplier([starts[i]], [current[i]], epochs,
-                                   remaining=remaining, target=target, clip=clip,
-                                   probe_at=measured[i].multiplier)
-                  for i in range(len(measured))]
-    else:
-        values = [probe_multiplier([starts[i]], [current[i]], epochs,
-                                   remaining=remaining, target=target, clip=clip,
-                                   probe_at=probe_at)
-                  for i in range(len(measured))]
+    scales = ([probed_at] * len(measured) if probed_at is not None
+              else [m.multiplier for m in measured])
+    values = [probe_multiplier([starts[i]], [current[i]], epochs,
+                               remaining=remaining, target=target, clip=clip,
+                               probe_at=scales[i])
+              for i in range(len(measured))]
 
-    seen = set()
-    for m, value in zip(measured, values):
-        for other in modules:                     # every site sharing this tensor
+    for m, value in zip(measured, values):        # every site sharing this tensor
+        for other in modules:
             if other.params is m.params:
                 other.multiplier = value
-    if verbose:
+
+    result = values[0] if len(values) == 1 else values
+    if param_group is not None:
+        if len(values) != 1:
+            raise ValueError(
+                'a single param_group needs one multiplier, but the activation '
+                f'sites calibrated to {values}; apply them yourself via '
+                'multipliers(model)')
+        if weight_lr is None:
+            if probed_at is None or probed_at <= 0.0:
+                raise ValueError('cannot infer the weight lr from the param group; '
+                                 'pass weight_lr=')
+            weight_lr = float(param_group['lr']) / probed_at
+        param_group['lr'] = float(weight_lr) * result
+        if verbose:
+            print(f'calibrated activation lr: {param_group["lr"]:.3e} '
+                  f'(weight lr {float(weight_lr):.3e} x {result:.3f})')
+    elif verbose:
         print(f'calibrated activation multiplier: {values}')
-    return values[0] if len(values) == 1 else values
+
+    return result
 
 
 # --------------------------------------------------------------------------- #
@@ -757,9 +781,9 @@ if __name__ == '__main__':
     print(f'activation lr = weight lr x {multiplier(net):.3f} before calibration')
     for epoch in range(EPOCHS):
         if epoch == 1:                        # one epoch has been trained
-            calibrate(net)                    # stores .multiplier on the modules
-            opt.param_groups[1]['lr'] = WEIGHT_LR * multiplier(net)
-            print(f'  epoch {epoch}: calibrated to {multiplier(net):.3f}')
+            calibrate(net, opt.param_groups[1])
+            print(f'  epoch {epoch}: multiplier {multiplier(net):.3f}, '
+                  f'act lr {opt.param_groups[1]["lr"]:.2e}')
         train_one_epoch()
     d = displacement([torch.tensor(INIT_AB)], [mods[0].params.detach()])
     print(f'after {EPOCHS} epochs the curve sits at {mods[0]} '
